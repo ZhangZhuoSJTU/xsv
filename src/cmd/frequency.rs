@@ -1,6 +1,8 @@
 use std::fs;
 use std::io;
 
+use std::collections::HashMap;
+
 use channel;
 use csv;
 use stats::{Frequencies, merge_all};
@@ -104,6 +106,64 @@ type Headers = csv::ByteRecord;
 type FTable = Frequencies<Vec<u8>>;
 type FTables = Vec<Frequencies<Vec<u8>>>;
 
+const CACHE_CAPACITY: usize = 32;
+const MAX_CACHED_FIELD_BYTES: usize = 64;
+
+struct CacheEntry {
+    raw: Vec<u8>,
+    normalized: Vec<u8>,
+}
+
+struct TrimCache {
+    entries: Vec<CacheEntry>,
+    positions: HashMap<Vec<u8>, usize>,
+}
+
+impl TrimCache {
+    fn new() -> TrimCache {
+        TrimCache {
+            entries: Vec::new(),
+            positions: HashMap::new(),
+        }
+    }
+
+    fn normalize(&mut self, raw: Vec<u8>) -> Vec<u8> {
+        if let Some(&slot) = self.positions.get(&raw) {
+            return self.entries[slot].normalized.clone();
+        }
+
+        let normalized = trim(raw.clone());
+
+        let mut evicted = false;
+
+        if self.entries.len() == CACHE_CAPACITY {
+            let removed = self.entries.swap_remove(0);
+            self.positions.remove(&removed.raw);
+            evicted = true;
+        }
+
+        if normalized.len() > MAX_CACHED_FIELD_BYTES {
+            return normalized;
+        }
+
+        if evicted {
+            let moved_key = self.entries[0].raw.clone();
+            self.positions.insert(moved_key, 0);
+        }
+
+        let next_slot = self.entries.len();
+
+        self.entries.push(CacheEntry {
+            raw: raw.clone(),
+            normalized: normalized.clone(),
+        });
+
+        self.positions.insert(raw, next_slot);
+
+        normalized
+    }
+}
+
 impl Args {
     fn rconfig(&self) -> Config {
         Config::new(&self.arg_input)
@@ -169,10 +229,11 @@ impl Args {
         let nsel = sel.normal();
         let mut tabs: Vec<_> =
             (0..nsel.len()).map(|_| Frequencies::new()).collect();
+        let mut trim_cache = TrimCache::new();
         for row in it {
             let row = row?;
             for (i, field) in nsel.select(row.into_iter()).enumerate() {
-                let field = trim(field.to_vec());
+                let field = trim_cache.normalize(field.to_vec());
                 if !field.is_empty() {
                     tabs[i].add(field);
                 } else {
