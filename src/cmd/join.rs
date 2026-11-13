@@ -1,18 +1,18 @@
-use std::collections::hash_map::{HashMap, Entry};
-use std::fmt;
 use std::fs;
 use std::io;
 use std::iter::repeat;
-use std::str;
 
-use byteorder::{WriteBytesExt, BigEndian};
 use csv;
 
 use CliResult;
 use config::{Config, Delimiter};
-use index::Indexed;
 use select::{SelectColumns, Selection};
 use util;
+
+mod index;
+mod keys;
+use self::index::{RowMatches, ValueIndex};
+use self::keys::get_row_key;
 
 static USAGE: &'static str = "
 Joins two sets of CSV data on the specified columns.
@@ -71,8 +71,6 @@ Common options:
                            Must be a single character. (default: ,)
 ";
 
-type ByteString = Vec<u8>;
-
 #[derive(Deserialize)]
 struct Args {
     arg_columns1: SelectColumns,
@@ -89,7 +87,6 @@ struct Args {
     flag_nulls: bool,
     flag_delimiter: Option<Delimiter>,
 }
-
 pub fn run(argv: &[&str]) -> CliResult<()> {
     let args: Args = util::get_args(USAGE, argv)?;
     let mut state = args.new_io_state()?;
@@ -212,8 +209,7 @@ impl<R: io::Read + io::Seek, W: io::Write> IoState<R, W> {
             self.rdr2, &self.sel2, self.casei, self.nulls)?;
 
         // Keep track of which rows we've written from rdr2.
-        let mut rdr2_written: Vec<_> =
-            repeat(false).take(validx.num_rows).collect();
+        let mut matched_rows = RowMatches::new(&validx);
         for row1 in self.rdr1.byte_records() {
             let row1 = row1?;
             let key = get_row_key(&self.sel1, &row1, self.casei);
@@ -223,7 +219,7 @@ impl<R: io::Read + io::Seek, W: io::Write> IoState<R, W> {
                 }
                 Some(rows) => {
                     for &rowi in rows.iter() {
-                        rdr2_written[rowi] = true;
+                        matched_rows.mark(rowi);
 
                         validx.idx.seek(rowi as u64)?;
                         validx.idx.read_byte_record(&mut scratch)?;
@@ -235,8 +231,8 @@ impl<R: io::Read + io::Seek, W: io::Write> IoState<R, W> {
 
         // OK, now write any row from rdr2 that didn't get joined with a row
         // from rdr1.
-        for (i, &written) in rdr2_written.iter().enumerate() {
-            if !written {
+        for i in 0..validx.num_rows {
+            if !matched_rows.contains(i) {
                 validx.idx.seek(i as u64)?;
                 validx.idx.read_byte_record(&mut scratch)?;
                 self.wtr.write_record(pad1.iter().chain(&scratch))?;
@@ -320,117 +316,5 @@ impl Args {
                 select1.len(), select2.len()));
         }
         Ok((select1, select2))
-    }
-}
-
-struct ValueIndex<R> {
-    // This maps tuples of values to corresponding rows.
-    values: HashMap<Vec<ByteString>, Vec<usize>>,
-    idx: Indexed<R, io::Cursor<Vec<u8>>>,
-    num_rows: usize,
-}
-
-impl<R: io::Read + io::Seek> ValueIndex<R> {
-    fn new(
-        mut rdr: csv::Reader<R>,
-        sel: &Selection,
-        casei: bool,
-        nulls: bool,
-    ) -> CliResult<ValueIndex<R>> {
-        let mut val_idx = HashMap::with_capacity(10000);
-        let mut row_idx = io::Cursor::new(Vec::with_capacity(8 * 10000));
-        let (mut rowi, mut count) = (0usize, 0usize);
-
-        // This logic is kind of tricky. Basically, we want to include
-        // the header row in the line index (because that's what csv::index
-        // does), but we don't want to include header values in the ValueIndex.
-        if !rdr.has_headers() {
-            // ... so if there are no headers, we seek to the beginning and
-            // index everything.
-            let mut pos = csv::Position::new();
-            pos.set_byte(0);
-            rdr.seek(pos)?;
-        } else {
-            // ... and if there are headers, we make sure that we've parsed
-            // them, and write the offset of the header row to the index.
-            rdr.byte_headers()?;
-            row_idx.write_u64::<BigEndian>(0)?;
-            count += 1;
-        }
-
-        let mut row = csv::ByteRecord::new();
-        while rdr.read_byte_record(&mut row)? {
-            // This is a bit hokey. We're doing this manually instead of using
-            // the `csv-index` crate directly so that we can create both
-            // indexes in one pass.
-            row_idx.write_u64::<BigEndian>(row.position().unwrap().byte())?;
-
-            let fields: Vec<_> = sel
-                .select(&row)
-                .map(|v| transform(v, casei))
-                .collect();
-            if nulls || !fields.iter().any(|f| f.is_empty()) {
-                match val_idx.entry(fields) {
-                    Entry::Vacant(v) => {
-                        let mut rows = Vec::with_capacity(4);
-                        rows.push(rowi);
-                        v.insert(rows);
-                    }
-                    Entry::Occupied(mut v) => {
-                        v.get_mut().push(rowi);
-                    }
-                }
-            }
-            rowi += 1;
-            count += 1;
-        }
-
-        row_idx.write_u64::<BigEndian>(count as u64)?;
-        let idx = Indexed::open(rdr, io::Cursor::new(row_idx.into_inner()))?;
-        Ok(ValueIndex {
-            values: val_idx,
-            idx: idx,
-            num_rows: rowi,
-        })
-    }
-}
-
-impl<R> fmt::Debug for ValueIndex<R> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Sort the values by order of first appearance.
-        let mut kvs = self.values.iter().collect::<Vec<_>>();
-        kvs.sort_by(|&(_, v1), &(_, v2)| v1[0].cmp(&v2[0]));
-        for (keys, rows) in kvs.into_iter() {
-            // This is just for debugging, so assume Unicode for now.
-            let keys = keys.iter()
-                           .map(|k| String::from_utf8(k.to_vec()).unwrap())
-                           .collect::<Vec<_>>();
-            writeln!(f, "({}) => {:?}", keys.join(", "), rows)?
-        }
-        Ok(())
-    }
-}
-
-fn get_row_key(
-    sel: &Selection,
-    row: &csv::ByteRecord,
-    casei: bool,
-) -> Vec<ByteString> {
-    sel.select(row).map(|v| transform(&v, casei)).collect()
-}
-
-fn transform(bs: &[u8], casei: bool) -> ByteString {
-    match str::from_utf8(bs) {
-        Err(_) => bs.to_vec(),
-        Ok(s) => {
-            if !casei {
-                s.trim().as_bytes().to_vec()
-            } else {
-                let norm: String =
-                    s.trim().chars()
-                     .map(|c| c.to_lowercase().next().unwrap()).collect();
-                norm.into_bytes()
-            }
-        }
     }
 }
