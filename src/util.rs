@@ -97,6 +97,7 @@ pub fn condense<'a>(val: Cow<'a, [u8]>, n: Option<usize>) -> Cow<'a, [u8]> {
                     is_short_utf8 = true;
                 } else {
                     let mut s = s.chars().take(n).collect::<String>();
+                    // let mut s = s[..n].to_owned();
                     s.push_str("...");
                     return Cow::Owned(s.into_bytes());
                 }

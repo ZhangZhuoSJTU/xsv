@@ -94,6 +94,14 @@ struct Args {
 }
 
 fn main() {
+
+    if let Some(first_arg) = env::args().nth(1) {
+        if !first_arg.is_empty() {
+            // let _is_option = &first_arg[..1] == "-";
+            let _is_option = first_arg.starts_with('-');
+        }
+    }
+
     let args: Args = Docopt::new(USAGE)
                             .and_then(|d| d.options_first(true)
                                            .version(Some(util::version()))
